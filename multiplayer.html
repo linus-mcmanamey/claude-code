@@ -1,0 +1,144 @@
+<!-- ============================================================================
+     multiplayer.html — drop-in host/join for any browser game or page.
+     H opens your world and shows a 5-letter code. J takes a friend's code.
+     One host, everyone else a guest; the host relays. No server to run.
+
+     To use: paste the three blocks below into your page, then wire it up:
+
+       MP.state = () => ({ seed, blocks, time })        // host: what a new guest gets
+       MP.onStart = (state, myId) => loadWorld(state)   // guest: apply it
+       MP.onMessage = (m, from) => { ... }              // anything MP.send() carries
+       MP.onPlayerJoin = id => addFigure(id)
+       MP.onPlayerLeave = id => removeFigure(id)
+       MP.send({ t:'pos', x, y, z })                    // to everyone else
+
+     The host is always id 1, guests are 2, 3, 4… MP.room is the code, MP.hosting
+     says which side you are on, MP.players holds the other ids.
+
+     One rule worth keeping: only send plain data. Anything holding a connection,
+     a DOM node or a THREE object throws inside the serialiser and the message
+     never arrives — build a small object with the fields you mean, don't spread
+     a live game entity onto the wire.
+============================================================================ -->
+
+<!-- 1. markup — anywhere in <body> ------------------------------------------->
+<div id="mpPanel" hidden>
+  <h2 id="mpTitle"></h2><div id="mpCode"></div><p id="mpMsg"></p>
+  <div class="mpRow">
+    <input id="mpIn" maxlength="5" placeholder="Code" autocomplete="off" spellcheck="false">
+    <button id="mpGo">Join</button><button id="mpCopy">Copy</button><button id="mpLeave">Leave</button><button id="mpClose">Close</button>
+  </div>
+</div>
+
+<!-- 2. style ----------------------------------------------------------------->
+<style>
+  #mpPanel{position:fixed;right:14px;top:14px;z-index:99;width:250px;padding:14px 16px;border-radius:10px;
+    background:rgba(20,22,28,.94);color:#fff;font:14px/1.4 system-ui,sans-serif;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+  #mpPanel[hidden]{display:none}
+  #mpPanel h2{margin:0 0 6px;font-size:15px}
+  #mpMsg{margin:4px 0 10px;font-size:12px;opacity:.8;min-height:1em}
+  #mpCode{font-size:36px;font-weight:800;letter-spacing:.2em;margin:4px 0 2px}#mpCode:empty{display:none}
+  .mpRow{display:flex;gap:6px;flex-wrap:wrap}.mpRow [hidden]{display:none}
+  #mpIn{flex:1;min-width:100px;padding:6px 8px;border:1px solid rgba(255,255,255,.3);border-radius:5px;
+    background:rgba(0,0,0,.35);color:#fff;font:inherit;font-size:16px;letter-spacing:.15em;text-transform:uppercase}
+  #mpPanel button{padding:5px 10px;border:1px solid rgba(255,255,255,.3);border-radius:5px;background:none;color:#fff;font:inherit;cursor:pointer}
+  #mpPanel button:hover{background:rgba(255,255,255,.12)}
+</style>
+
+<!-- 3. script — PeerJS first, then the module -------------------------------->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.5/peerjs.min.js"></script>
+<script>
+const MP=(()=>{
+const $=id=>document.getElementById(id), el=$('mpPanel'), inp=$('mpIn'), codeEl=$('mpCode'), msgEl=$('mpMsg'), titleEl=$('mpTitle');
+const CODE='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';                                  // no I, O, 0 or 1 — a code read down the phone can't be mistyped
+const ICE=[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302']}], TURN='staticauth.openrelay.metered.ca', SECRET='openrelayprojectsecret';
+const WHY={'no-peerjs':'The PeerJS library did not load — check your connection.',
+  'peer-unavailable':'No world with that code is open — check the code with the host.',
+  network:'Could not reach the matchmaking server — check your connection and try again.',
+  timeout:'Found the host but nothing got through — a firewall is in the way. Try the same Wi-Fi or a phone hotspot.',
+  webrtc:'The connection dropped on the way — try again.'};
+
+const MP={room:'',hosting:false,players:new Set(),id:0,server:null,              // the host is 1, guests are 2, 3, 4…; server: your own PeerServer, e.g. {host:'…',port:443,path:'/',secure:true}
+  state:()=>null, onStart(){}, onMessage(){}, onPlayerJoin(){}, onPlayerLeave(){}, onStatus:null};
+let peer=null, out=null, guests=new Map(), next=2;                              // out: send to the host; guests: conn → id
+const status=t=>{ msgEl.textContent=t; MP.onStatus?.(t); };
+const newCode=()=>Array.from(crypto.getRandomValues(new Uint8Array(5)),b=>CODE[b%32]).join('');
+const clean=s=>[...(s||'').toUpperCase()].filter(c=>CODE.includes(c)).join('').slice(0,5);
+
+function show(mode){                                                            // 'host' | 'join' | 'info'
+  el.hidden=false; inp.hidden=$('mpGo').hidden=mode!=='join'; $('mpCopy').hidden=mode!=='host'; $('mpLeave').hidden=!MP.room;
+  titleEl.textContent=mode==='join'?'Join a friend':mode==='host'?'Your world is open':'Shared world';
+  codeEl.textContent=mode==='host'?MP.room:''; if(mode==='join'){ inp.value=''; setTimeout(()=>inp.focus(),0); }
+}
+async function ice(){                                                           // Open Relay's TURN, so two players behind home routers still meet
+  try{ const enc=new TextEncoder(), u=`${Math.floor(Date.now()/1e3)+43200}:mp`,
+      k=await crypto.subtle.importKey('raw',enc.encode(SECRET),{name:'HMAC',hash:'SHA-1'},false,['sign']),
+      cred=btoa(String.fromCharCode(...new Uint8Array(await crypto.subtle.sign('HMAC',k,enc.encode(u)))));
+    return [...ICE,{urls:[`turn:${TURN}:80`,`turn:${TURN}:443`,`turn:${TURN}:443?transport=tcp`],username:u,credential:cred}]; }
+  catch{ return ICE; }
+}
+async function endpoint(id){                                                    // a PeerJS endpoint, with one retry — the public server is busy now and then
+  if(typeof Peer==='undefined') throw 'no-peerjs';
+  const config={iceServers:await ice()}; let why='network';
+  for(let i=0;i<2;i++){ const p=new Peer(id,{...MP.server,config});
+    if(await new Promise(r=>{ const t=setTimeout(()=>r(false),9000);
+      p.once('open',()=>{ clearTimeout(t); r(true); }); p.once('error',e=>{ clearTimeout(t); why=e.type; r(false); }); })) return p;
+    p.destroy(); if(why==='unavailable-id') throw 'taken'; }
+  throw why;
+}
+MP.host=async()=>{
+  if(MP.room) return show(MP.hosting?'host':'info');
+  MP.room=newCode(); MP.hosting=true; show('host'); status('Opening your world…');
+  try{ peer=await endpoint('mp-'+MP.room); }
+  catch(e){ MP.leave(); return status(WHY[e]||`Could not open the world (${e}).`); }
+  peer.on('connection',c=>c.on('open',()=>{
+    const id=next++; guests.set(c,id); MP.players.add(id); status(`${guests.size+1} online`);
+    c.send({t:'welcome',id,state:MP.state()});                                  // the newcomer gets the world as it stands
+    for(const [o,oid] of guests) if(o!==c){ o.send({t:'join',id}); c.send({t:'join',id:oid}); }
+    MP.onPlayerJoin(id);
+    c.on('data',m=>{ if(m?.t!=='m') return; MP.onMessage(m.d,id); for(const [o] of guests) if(o!==c) o.send({t:'m',id,d:m.d}); });
+    c.on('close',()=>{ if(!guests.delete(c)) return; MP.players.delete(id); MP.onPlayerLeave(id);
+      for(const [o] of guests) o.send({t:'left',id}); status(`${guests.size+1} online`); });
+  }));
+  MP.id=1; show('host'); status('Send the code to a friend — they press J and type it in.');
+};
+MP.join=async code=>{
+  code=clean(code); if(code.length!==5) return status('Enter the 5-letter code the host is showing');
+  if(MP.room) return; MP.room=code; MP.hosting=false; show('join'); status(`Looking for ${code}…`);
+  let c; try{
+    peer=await endpoint();
+    c=await new Promise((res,rej)=>{ const k=peer.connect('mp-'+code,{reliable:true}), t=setTimeout(()=>{ k.close(); rej('timeout'); },20000);
+      k.on('open',()=>{ clearTimeout(t); res(k); }); k.on('close',()=>{ clearTimeout(t); rej('webrtc'); });
+      peer.on('error',e=>{ clearTimeout(t); rej(e.type); }); });
+  } catch(e){ MP.leave(); show('join'); return status(WHY[e]||`Couldn't join (${e}).`); }
+  out=c; MP.players.add(1); status(`Connected to ${code}`); setTimeout(()=>{ if(out===c) el.hidden=true; },1500);
+  c.on('data',m=>{ if(!m||typeof m!=='object') return;
+    if(m.t==='welcome'){ MP.id=m.id; MP.onStart(m.state,m.id); }
+    else if(m.t==='join'){ MP.players.add(m.id); MP.onPlayerJoin(m.id); }
+    else if(m.t==='left'){ MP.players.delete(m.id); MP.onPlayerLeave(m.id); }
+    else if(m.t==='m') MP.onMessage(m.d,m.id); });
+  c.on('close',()=>{ if(out!==c) return; MP.leave(); show('info'); status('The host closed the world'); });
+};
+MP.send=d=>{ if(MP.hosting) for(const [c] of guests) c.send({t:'m',id:1,d}); else out?.send({t:'m',d}); };
+MP.leave=()=>{
+  for(const id of MP.players) MP.onPlayerLeave(id);
+  try{ out?.close(); }catch{} for(const [c] of guests) try{ c.close(); }catch{}
+  peer?.destroy(); peer=out=null; guests=new Map(); next=2; MP.players.clear(); MP.room=''; MP.hosting=false; MP.id=0;
+};
+MP.show=show;
+
+$('mpGo').onclick=()=>MP.join(inp.value);
+$('mpClose').onclick=()=>el.hidden=true;
+$('mpLeave').onclick=()=>{ MP.leave(); show('info'); status('You left the shared world'); };
+$('mpCopy').onclick=()=>navigator.clipboard?.writeText(MP.room)
+  .then(()=>status('Code copied — your friend presses J and types it in'),()=>status('Select the code above and copy it'));
+inp.oninput=()=>inp.value=clean(inp.value);
+addEventListener('keydown',e=>{
+  if(e.target===inp){ if(e.key==='Enter') MP.join(inp.value); else if(e.key==='Escape') el.hidden=true; return; }
+  if(e.repeat||/^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)||e.target.isContentEditable) return;
+  if(e.code==='KeyH') MP.host(); else if(e.code==='KeyJ') show(MP.room?'info':'join');
+});
+addEventListener('pagehide',()=>MP.leave());
+return MP;
+})();
+</script>
